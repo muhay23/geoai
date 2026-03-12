@@ -1,0 +1,7 @@
+flask
+firebase-admin
+numpy
+scikit-learn
+shapely
+geopandas
+gunicorn

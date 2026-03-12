@@ -5,11 +5,13 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from shapely.geometry import MultiPoint
 import os
+import json
 
 app = Flask(__name__)
 
 # ── CONNECT TO FIREBASE ──────────────────────────────────────────────
-cred = credentials.Certificate('serviceAccount.json')
+service_account_info = json.loads(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON'))
+cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -46,7 +48,7 @@ def analyze():
         coords_rad = np.radians(coords)
 
         kms_per_radian = 6371.0088
-        epsilon = 1.0 / kms_per_radian  # 1km radius
+        epsilon = 1.0 / kms_per_radian
 
         labels = DBSCAN(
             eps=epsilon,
@@ -68,7 +70,6 @@ def analyze():
             center_lat = float(np.mean([i['lat'] for i in cluster_incidents]))
             center_lng = float(np.mean([i['lng'] for i in cluster_incidents]))
 
-            # Calculate radius
             max_dist = 0
             for i in cluster_incidents:
                 dist = np.sqrt((i['lat'] - center_lat)**2 + (i['lng'] - center_lng)**2) * 111
@@ -76,7 +77,6 @@ def analyze():
                     max_dist = dist
             radius_km = max(max_dist * 1.3, 0.5)
 
-            # Severity
             severities = [i['severity'] for i in cluster_incidents]
             if 'high' in severities:
                 severity = 'high'
@@ -95,7 +95,6 @@ def analyze():
                 f"Civilians advised to avoid this zone."
             )
 
-            # Save zone to Firestore
             zone_data = {
                 'centerLat': center_lat,
                 'centerLng': center_lng,

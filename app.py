@@ -1,11 +1,11 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, messaging
 import numpy as np
 from sklearn.cluster import DBSCAN
-from shapely.geometry import MultiPoint
 import os
 import json
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -15,6 +15,119 @@ cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+
+# ── HELPER: GET ALL USER FCM TOKENS ──────────────────────────────────
+def get_all_fcm_tokens():
+    tokens = []
+    try:
+        users = db.collection('users').stream()
+        for user in users:
+            data = user.to_dict()
+            token = data.get('fcmToken')
+            if token:
+                tokens.append(token)
+    except Exception as e:
+        print(f'Failed to get FCM tokens: {e}')
+    return tokens
+
+
+# ── HELPER: SEND NOTIFICATION TO ALL USERS ───────────────────────────
+def send_notification_to_all(title, body):
+    try:
+        tokens = get_all_fcm_tokens()
+        if not tokens:
+            print('No FCM tokens found')
+            return
+
+        # Send in batches of 500 (FCM limit)
+        batch_size = 500
+        for i in range(0, len(tokens), batch_size):
+            batch = tokens[i:i + batch_size]
+            message = messaging.MulticastMessage(
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
+                ),
+                android=messaging.AndroidConfig(
+                    priority='high',
+                    notification=messaging.AndroidNotification(
+                        channel_id='conflict_tracker_channel',
+                        priority='high',
+                    ),
+                ),
+                tokens=batch,
+            )
+            response = messaging.send_each_for_multicast(message)
+            print(f'Sent {response.success_count} notifications successfully')
+            if response.failure_count > 0:
+                print(f'Failed to send {response.failure_count} notifications')
+
+    except Exception as e:
+        print(f'Failed to send notifications: {e}')
+
+
+# ── HELPER: SEND NOTIFICATION TO ONE USER ────────────────────────────
+def send_notification_to_user(token, title, body):
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    channel_id='conflict_tracker_channel',
+                    priority='high',
+                ),
+            ),
+            token=token,
+        )
+        response = messaging.send(message)
+        print(f'Sent notification: {response}')
+    except Exception as e:
+        print(f'Failed to send notification to user: {e}')
+
+
+# ── ENDPOINT: NOTIFY REPORT STATUS CHANGE ────────────────────────────
+# Called from admin panel when approving or rejecting a report
+@app.route('/notify_report', methods=['POST'])
+def notify_report():
+    try:
+        data = request.get_json()
+        user_id = data.get('userId')
+        status = data.get('status')  # 'approved' or 'rejected'
+        category = data.get('category', 'incident')
+
+        if not user_id or not status:
+            return jsonify({'success': False, 'error': 'Missing userId or status'}), 400
+
+        # Get user FCM token
+        user_doc = db.collection('users').document(user_id).get()
+        if not user_doc.exists:
+            return jsonify({'success': False, 'error': 'User not found'}), 404
+
+        token = user_doc.to_dict().get('fcmToken')
+        if not token:
+            return jsonify({'success': False, 'error': 'No FCM token for user'}), 404
+
+        # Build notification
+        if status == 'approved':
+            title = '✅ Report Approved'
+            body = f'Your {category} report has been reviewed and approved by our team.'
+        else:
+            title = '❌ Report Rejected'
+            body = f'Your {category} report was reviewed but could not be verified at this time.'
+
+        send_notification_to_user(token, title, body)
+
+        return jsonify({'success': True, 'message': f'Notification sent to user {user_id}'})
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── MAIN ANALYZE ENDPOINT ─────────────────────────────────────────────
 @app.route('/analyze', methods=['GET'])
 def analyze():
     try:
@@ -34,79 +147,129 @@ def analyze():
                 'lng': float(lng),
                 'severity': data.get('severity', 'low'),
                 'category': data.get('category', 'unknown'),
+                'description': data.get('description', ''),
             })
 
-        if len(incidents) < 2:
+        if len(incidents) == 0:
             return jsonify({
                 'success': True,
                 'zones': [],
-                'message': 'Not enough incidents to form zones'
+                'message': 'No approved incidents found'
             })
 
-        # ── RUN DBSCAN CLUSTERING ─────────────────────────────────────
-        coords = np.array([[i['lat'], i['lng']] for i in incidents])
-        coords_rad = np.radians(coords)
-
-        kms_per_radian = 6371.0088
-        epsilon = 1.0 / kms_per_radian
-
-        labels = DBSCAN(
-            eps=epsilon,
-            min_samples=2,
-            algorithm='ball_tree',
-            metric='haversine'
-        ).fit(coords_rad).labels_
-
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-
-        # ── BUILD ZONES ───────────────────────────────────────────────
         zones = []
-        for cluster_id in set(labels):
-            if cluster_id == -1:
-                continue
+        now_iso = datetime.utcnow().isoformat()
 
-            cluster_incidents = [incidents[i] for i, l in enumerate(labels) if l == cluster_id]
+        if len(incidents) >= 2:
+            # ── RUN DBSCAN CLUSTERING ─────────────────────────────────
+            coords = np.array([[i['lat'], i['lng']] for i in incidents])
+            coords_rad = np.radians(coords)
 
-            center_lat = float(np.mean([i['lat'] for i in cluster_incidents]))
-            center_lng = float(np.mean([i['lng'] for i in cluster_incidents]))
+            kms_per_radian = 6371.0088
+            epsilon = 1.0 / kms_per_radian  # 1km radius
 
-            max_dist = 0
-            for i in cluster_incidents:
-                dist = np.sqrt((i['lat'] - center_lat)**2 + (i['lng'] - center_lng)**2) * 111
-                if dist > max_dist:
-                    max_dist = dist
-            radius_km = max(max_dist * 1.3, 0.5)
+            labels = DBSCAN(
+                eps=epsilon,
+                min_samples=2,
+                algorithm='ball_tree',
+                metric='haversine'
+            ).fit(coords_rad).labels_
 
-            severities = [i['severity'] for i in cluster_incidents]
-            if 'high' in severities:
-                severity = 'high'
-            elif 'medium' in severities:
-                severity = 'medium'
-            else:
-                severity = 'low'
+            # ── BUILD CLUSTER ZONES ───────────────────────────────────
+            for cluster_id in set(labels):
+                if cluster_id == -1:
+                    continue
 
-            categories = list(set([i['category'] for i in cluster_incidents]))
-            cat_str = ', '.join(categories)
+                cluster_indices = [i for i, l in enumerate(labels) if l == cluster_id]
+                cluster_incidents = [incidents[i] for i in cluster_indices]
 
-            description = (
-                f"{len(cluster_incidents)} incident(s) detected in this area. "
-                f"Categories: {cat_str}. "
-                f"Severity: {severity.upper()}. "
-                f"Civilians advised to avoid this zone."
-            )
+                center_lat = float(np.mean([i['lat'] for i in cluster_incidents]))
+                center_lng = float(np.mean([i['lng'] for i in cluster_incidents]))
 
-            zone_data = {
-                'centerLat': center_lat,
-                'centerLng': center_lng,
-                'radiusKm': radius_km,
-                'severity': severity,
-                'incidentCount': len(cluster_incidents),
-                'description': description,
-                'categories': categories,
-                'active': True,
-            }
+                max_dist = 0
+                for i in cluster_incidents:
+                    dist = np.sqrt(
+                        (i['lat'] - center_lat) ** 2 +
+                        (i['lng'] - center_lng) ** 2
+                    ) * 111
+                    if dist > max_dist:
+                        max_dist = dist
+                radius_km = max(max_dist * 1.3, 0.5)
 
-            zones.append(zone_data)
+                severities = [i['severity'] for i in cluster_incidents]
+                if 'high' in severities:
+                    severity = 'high'
+                elif 'medium' in severities:
+                    severity = 'medium'
+                else:
+                    severity = 'low'
+
+                categories = list(set([i['category'] for i in cluster_incidents]))
+                cat_str = ', '.join(categories)
+
+                description = (
+                    f"{len(cluster_incidents)} incident(s) detected in this area. "
+                    f"Categories: {cat_str}. "
+                    f"Severity: {severity.upper()}. "
+                    f"Civilians advised to avoid this zone."
+                )
+
+                zones.append({
+                    'centerLat': center_lat,
+                    'centerLng': center_lng,
+                    'radiusKm': radius_km,
+                    'severity': severity,
+                    'incidentCount': len(cluster_incidents),
+                    'description': description,
+                    'categories': categories,
+                    'active': True,
+                    'zoneType': 'cluster',
+                    'createdAt': now_iso,
+                })
+
+            # ── SINGLE HIGH SEVERITY INCIDENTS (noise points) ─────────
+            for i, label in enumerate(labels):
+                if label == -1 and incidents[i]['severity'] == 'high':
+                    inc = incidents[i]
+                    zones.append({
+                        'centerLat': inc['lat'],
+                        'centerLng': inc['lng'],
+                        'radiusKm': 0.5,
+                        'severity': 'high',
+                        'incidentCount': 1,
+                        'description': (
+                            f"High severity incident detected. "
+                            f"Category: {inc['category']}. "
+                            f"Severity: HIGH. "
+                            f"Civilians advised to avoid this zone."
+                        ),
+                        'categories': [inc['category']],
+                        'active': True,
+                        'zoneType': 'single',
+                        'createdAt': now_iso,
+                    })
+
+        else:
+            # Only 1 incident — create zone only if high severity
+            inc = incidents[0]
+            if inc['severity'] == 'high':
+                zones.append({
+                    'centerLat': inc['lat'],
+                    'centerLng': inc['lng'],
+                    'radiusKm': 0.5,
+                    'severity': 'high',
+                    'incidentCount': 1,
+                    'description': (
+                        f"High severity incident detected. "
+                        f"Category: {inc['category']}. "
+                        f"Severity: HIGH. "
+                        f"Civilians advised to avoid this zone."
+                    ),
+                    'categories': [inc['category']],
+                    'active': True,
+                    'zoneType': 'single',
+                    'createdAt': now_iso,
+                })
 
         # ── CLEAR OLD ZONES AND SAVE NEW ONES ────────────────────────
         old_zones = db.collection('danger_zones').stream()
@@ -116,14 +279,38 @@ def analyze():
         for zone in zones:
             db.collection('danger_zones').add(zone)
 
+        # ── SEND NOTIFICATION IF NEW DANGER ZONES CREATED ────────────
+        if len(zones) > 0:
+            severity_counts = {'high': 0, 'medium': 0, 'low': 0}
+            for z in zones:
+                severity_counts[z['severity']] = \
+                    severity_counts.get(z['severity'], 0) + 1
+
+            if severity_counts['high'] > 0:
+                title = '🚨 Danger Zone Alert'
+                body = (f'{len(zones)} danger zone(s) detected near you. '
+                        f'{severity_counts["high"]} HIGH severity. '
+                        f'Stay safe and avoid affected areas.')
+            elif severity_counts['medium'] > 0:
+                title = '⚠️ Danger Zone Warning'
+                body = (f'{len(zones)} danger zone(s) detected in your area. '
+                        f'Exercise caution and stay informed.')
+            else:
+                title = '📍 Zone Update'
+                body = (f'{len(zones)} zone(s) have been identified. '
+                        f'Stay alert and monitor updates.')
+
+            send_notification_to_all(title, body)
+
         return jsonify({
             'success': True,
             'zones': zones,
-            'message': f'{len(zones)} danger zones identified'
+            'message': f'{len(zones)} danger zone(s) identified'
         })
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True)

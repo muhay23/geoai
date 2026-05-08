@@ -15,6 +15,11 @@ cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# ── PING ENDPOINT (for UptimeRobot keep-alive) ────────────────────────
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({'status': 'ok'})
+
 
 # ── HELPER: GET ALL USER FCM TOKENS ──────────────────────────────────
 def get_all_fcm_tokens():
@@ -39,7 +44,6 @@ def send_notification_to_all(title, body):
             print('No FCM tokens found')
             return
 
-        # Send in batches of 500 (FCM limit)
         batch_size = 500
         for i in range(0, len(tokens), batch_size):
             batch = tokens[i:i + batch_size]
@@ -90,19 +94,17 @@ def send_notification_to_user(token, title, body):
 
 
 # ── ENDPOINT: NOTIFY REPORT STATUS CHANGE ────────────────────────────
-# Called from admin panel when approving or rejecting a report
 @app.route('/notify_report', methods=['POST'])
 def notify_report():
     try:
         data = request.get_json()
         user_id = data.get('userId')
-        status = data.get('status')  # 'approved' or 'rejected'
+        status = data.get('status')
         category = data.get('category', 'incident')
 
         if not user_id or not status:
             return jsonify({'success': False, 'error': 'Missing userId or status'}), 400
 
-        # Get user FCM token
         user_doc = db.collection('users').document(user_id).get()
         if not user_doc.exists:
             return jsonify({'success': False, 'error': 'User not found'}), 404
@@ -111,7 +113,6 @@ def notify_report():
         if not token:
             return jsonify({'success': False, 'error': 'No FCM token for user'}), 404
 
-        # Build notification
         if status == 'approved':
             title = '✅ Report Approved'
             body = f'Your {category} report has been reviewed and approved by our team.'
@@ -131,7 +132,6 @@ def notify_report():
 @app.route('/analyze', methods=['GET'])
 def analyze():
     try:
-        # ── FETCH APPROVED INCIDENTS ─────────────────────────────────
         reports_ref = db.collection('reports').where('status', '==', 'approved')
         docs = list(reports_ref.stream())
 
@@ -161,12 +161,11 @@ def analyze():
         now_iso = datetime.utcnow().isoformat()
 
         if len(incidents) >= 2:
-            # ── RUN DBSCAN CLUSTERING ─────────────────────────────────
             coords = np.array([[i['lat'], i['lng']] for i in incidents])
             coords_rad = np.radians(coords)
 
             kms_per_radian = 6371.0088
-            epsilon = 1.0 / kms_per_radian  # 1km radius
+            epsilon = 1.0 / kms_per_radian
 
             labels = DBSCAN(
                 eps=epsilon,
@@ -175,7 +174,6 @@ def analyze():
                 metric='haversine'
             ).fit(coords_rad).labels_
 
-            # ── BUILD CLUSTER ZONES ───────────────────────────────────
             for cluster_id in set(labels):
                 if cluster_id == -1:
                     continue
@@ -227,7 +225,6 @@ def analyze():
                     'createdAt': now_iso,
                 })
 
-            # ── SINGLE HIGH SEVERITY INCIDENTS (noise points) ─────────
             for i, label in enumerate(labels):
                 if label == -1 and incidents[i]['severity'] == 'high':
                     inc = incidents[i]
@@ -250,7 +247,6 @@ def analyze():
                     })
 
         else:
-            # Only 1 incident — create zone only if high severity
             inc = incidents[0]
             if inc['severity'] == 'high':
                 zones.append({

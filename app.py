@@ -15,6 +15,7 @@ cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+
 # ── PING ENDPOINT (for UptimeRobot keep-alive) ────────────────────────
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -59,6 +60,7 @@ def send_notification_to_all(title, body):
                         priority='high',
                     ),
                 ),
+                data={'type': 'danger_zone'},
                 tokens=batch,
             )
             response = messaging.send_each_for_multicast(message)
@@ -71,7 +73,7 @@ def send_notification_to_all(title, body):
 
 
 # ── HELPER: SEND NOTIFICATION TO ONE USER ────────────────────────────
-def send_notification_to_user(token, title, body):
+def send_notification_to_user(token, title, body, notif_type='report'):
     try:
         message = messaging.Message(
             notification=messaging.Notification(
@@ -85,12 +87,33 @@ def send_notification_to_user(token, title, body):
                     priority='high',
                 ),
             ),
+            data={'type': notif_type},
             token=token,
         )
         response = messaging.send(message)
         print(f'Sent notification: {response}')
     except Exception as e:
         print(f'Failed to send notification to user: {e}')
+
+
+# ── HELPER: CHECK IF ZONES ARE GENUINELY NEW ─────────────────────────
+def get_existing_zone_signatures():
+    """Get a set of existing zone signatures (centerLat+centerLng rounded)"""
+    try:
+        existing = db.collection('danger_zones').stream()
+        signatures = set()
+        for doc in existing:
+            data = doc.to_dict()
+            lat = data.get('centerLat')
+            lng = data.get('centerLng')
+            if lat and lng:
+                # Round to 4 decimal places for comparison
+                sig = f"{round(lat, 4)},{round(lng, 4)}"
+                signatures.add(sig)
+        return signatures
+    except Exception as e:
+        print(f'Failed to get existing zones: {e}')
+        return set()
 
 
 # ── ENDPOINT: NOTIFY REPORT STATUS CHANGE ────────────────────────────
@@ -120,7 +143,7 @@ def notify_report():
             title = '❌ Report Rejected'
             body = f'Your {category} report was reviewed but could not be verified at this time.'
 
-        send_notification_to_user(token, title, body)
+        send_notification_to_user(token, title, body, notif_type='report')
 
         return jsonify({'success': True, 'message': f'Notification sent to user {user_id}'})
 
@@ -132,6 +155,10 @@ def notify_report():
 @app.route('/analyze', methods=['GET'])
 def analyze():
     try:
+        # ── GET EXISTING ZONE SIGNATURES BEFORE DELETING ──────────
+        existing_signatures = get_existing_zone_signatures()
+
+        # ── FETCH APPROVED INCIDENTS ──────────────────────────────
         reports_ref = db.collection('reports').where('status', '==', 'approved')
         docs = list(reports_ref.stream())
 
@@ -186,10 +213,7 @@ def analyze():
 
                 max_dist = 0
                 for i in cluster_incidents:
-                    dist = np.sqrt(
-                        (i['lat'] - center_lat) ** 2 +
-                        (i['lng'] - center_lng) ** 2
-                    ) * 111
+                    dist = np.sqrt((i['lat'] - center_lat)**2 + (i['lng'] - center_lng)**2) * 111
                     if dist > max_dist:
                         max_dist = dist
                 radius_km = max(max_dist * 1.3, 0.5)
@@ -267,7 +291,7 @@ def analyze():
                     'createdAt': now_iso,
                 })
 
-        # ── CLEAR OLD ZONES AND SAVE NEW ONES ────────────────────────
+        # ── CLEAR OLD ZONES AND SAVE NEW ONES ────────────────────
         old_zones = db.collection('danger_zones').stream()
         for z in old_zones:
             z.reference.delete()
@@ -275,28 +299,43 @@ def analyze():
         for zone in zones:
             db.collection('danger_zones').add(zone)
 
-    # ── SEND NOTIFICATION ONLY FOR HIGH AND MEDIUM SEVERITY ──────────
-high_medium_zones = [z for z in zones if z['severity'] in ['high', 'medium']]
+        # ── FIND GENUINELY NEW ZONES ──────────────────────────────
+        new_zones = []
+        for zone in zones:
+            sig = f"{round(zone['centerLat'], 4)},{round(zone['centerLng'], 4)}"
+            if sig not in existing_signatures:
+                new_zones.append(zone)
 
-if len(high_medium_zones) > 0:
-    high_count = len([z for z in high_medium_zones if z['severity'] == 'high'])
-    medium_count = len([z for z in high_medium_zones if z['severity'] == 'medium'])
+        print(f'Total zones: {len(zones)}, Genuinely new: {len(new_zones)}')
 
-    if high_count > 0:
-        title = '🚨 Danger Zone Alert'
-        body = (f'{high_count} HIGH severity danger zone(s) detected. '
-                f'Stay safe and avoid affected areas.')
-    else:
-        title = '⚠️ Danger Zone Warning'
-        body = (f'{medium_count} MEDIUM severity danger zone(s) detected. '
-                f'Exercise caution and stay informed.')
+        # ── ONLY NOTIFY FOR GENUINELY NEW HIGH/MEDIUM ZONES ──────
+        new_high_medium = [z for z in new_zones
+                           if z['severity'] in ['high', 'medium']]
 
-    send_notification_to_all(title, body)
+        if len(new_high_medium) > 0:
+            high_count = len([z for z in new_high_medium
+                              if z['severity'] == 'high'])
+            medium_count = len([z for z in new_high_medium
+                                if z['severity'] == 'medium'])
+
+            if high_count > 0:
+                title = '🚨 Danger Zone Alert'
+                body = (f'{high_count} HIGH severity danger zone(s) detected. '
+                        f'Stay safe and avoid affected areas.')
+            else:
+                title = '⚠️ Danger Zone Warning'
+                body = (f'{medium_count} MEDIUM severity danger zone(s) detected. '
+                        f'Exercise caution and stay informed.')
+
+            send_notification_to_all(title, body)
+        else:
+            print('No genuinely new high/medium zones — no notification sent')
 
         return jsonify({
             'success': True,
             'zones': zones,
-            'message': f'{len(zones)} danger zone(s) identified'
+            'new_zones': len(new_zones),
+            'message': f'{len(zones)} danger zone(s) identified, {len(new_zones)} new'
         })
 
     except Exception as e:

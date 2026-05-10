@@ -275,28 +275,23 @@ def analyze():
         for zone in zones:
             db.collection('danger_zones').add(zone)
 
-        # ── SEND NOTIFICATION IF NEW DANGER ZONES CREATED ────────────
-        if len(zones) > 0:
-            severity_counts = {'high': 0, 'medium': 0, 'low': 0}
-            for z in zones:
-                severity_counts[z['severity']] = \
-                    severity_counts.get(z['severity'], 0) + 1
+    # ── SEND NOTIFICATION ONLY FOR HIGH AND MEDIUM SEVERITY ──────────
+high_medium_zones = [z for z in zones if z['severity'] in ['high', 'medium']]
 
-            if severity_counts['high'] > 0:
-                title = '🚨 Danger Zone Alert'
-                body = (f'{len(zones)} danger zone(s) detected near you. '
-                        f'{severity_counts["high"]} HIGH severity. '
-                        f'Stay safe and avoid affected areas.')
-            elif severity_counts['medium'] > 0:
-                title = '⚠️ Danger Zone Warning'
-                body = (f'{len(zones)} danger zone(s) detected in your area. '
-                        f'Exercise caution and stay informed.')
-            else:
-                title = '📍 Zone Update'
-                body = (f'{len(zones)} zone(s) have been identified. '
-                        f'Stay alert and monitor updates.')
+if len(high_medium_zones) > 0:
+    high_count = len([z for z in high_medium_zones if z['severity'] == 'high'])
+    medium_count = len([z for z in high_medium_zones if z['severity'] == 'medium'])
 
-            send_notification_to_all(title, body)
+    if high_count > 0:
+        title = '🚨 Danger Zone Alert'
+        body = (f'{high_count} HIGH severity danger zone(s) detected. '
+                f'Stay safe and avoid affected areas.')
+    else:
+        title = '⚠️ Danger Zone Warning'
+        body = (f'{medium_count} MEDIUM severity danger zone(s) detected. '
+                f'Exercise caution and stay informed.')
+
+    send_notification_to_all(title, body)
 
         return jsonify({
             'success': True,

@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
 import numpy as np
@@ -8,6 +9,7 @@ import json
 from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
 # ── CONNECT TO FIREBASE ──────────────────────────────────────────────
 service_account_info = json.loads(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON'))
@@ -16,10 +18,42 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 
-# ── PING ENDPOINT (for UptimeRobot keep-alive) ────────────────────────
+# ── PING ENDPOINT ────────────────────────────────────────────────────
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({'status': 'ok'})
+
+
+# ── HELPER: SAVE NOTIFICATION TO FIRESTORE ───────────────────────────
+def save_notification(user_id, title, body, notif_type):
+    try:
+        db.collection('notifications').add({
+            'userId': user_id,
+            'title': title,
+            'body': body,
+            'type': notif_type,
+            'isRead': False,
+            'createdAt': datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f'Failed to save notification: {e}')
+
+
+# ── HELPER: SAVE NOTIFICATION TO ALL USERS ───────────────────────────
+def save_notification_to_all(title, body, notif_type):
+    try:
+        users = db.collection('users').stream()
+        for user in users:
+            db.collection('notifications').add({
+                'userId': user.id,
+                'title': title,
+                'body': body,
+                'type': notif_type,
+                'isRead': False,
+                'createdAt': datetime.utcnow().isoformat(),
+            })
+    except Exception as e:
+        print(f'Failed to save notifications to all users: {e}')
 
 
 # ── HELPER: GET ALL USER FCM TOKENS ──────────────────────────────────
@@ -96,9 +130,8 @@ def send_notification_to_user(token, title, body, notif_type='report'):
         print(f'Failed to send notification to user: {e}')
 
 
-# ── HELPER: CHECK IF ZONES ARE GENUINELY NEW ─────────────────────────
+# ── HELPER: GET EXISTING ZONE SIGNATURES ─────────────────────────────
 def get_existing_zone_signatures():
-    """Get a set of existing zone signatures (centerLat+centerLng rounded)"""
     try:
         existing = db.collection('danger_zones').stream()
         signatures = set()
@@ -107,7 +140,6 @@ def get_existing_zone_signatures():
             lat = data.get('centerLat')
             lng = data.get('centerLng')
             if lat and lng:
-                # Round to 4 decimal places for comparison
                 sig = f"{round(lat, 4)},{round(lng, 4)}"
                 signatures.add(sig)
         return signatures
@@ -117,8 +149,11 @@ def get_existing_zone_signatures():
 
 
 # ── ENDPOINT: NOTIFY REPORT STATUS CHANGE ────────────────────────────
-@app.route('/notify_report', methods=['POST'])
+@app.route('/notify_report', methods=['POST', 'OPTIONS'])
 def notify_report():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+
     try:
         data = request.get_json()
         user_id = data.get('userId')
@@ -143,9 +178,16 @@ def notify_report():
             title = '❌ Report Rejected'
             body = f'Your {category} report was reviewed but could not be verified at this time.'
 
+        # Send push notification
         send_notification_to_user(token, title, body, notif_type='report')
 
-        return jsonify({'success': True, 'message': f'Notification sent to user {user_id}'})
+        # Save to Firestore notifications
+        save_notification(user_id, title, body, 'report')
+
+        return jsonify({
+            'success': True,
+            'message': f'Notification sent to user {user_id}'
+        })
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -155,10 +197,8 @@ def notify_report():
 @app.route('/analyze', methods=['GET'])
 def analyze():
     try:
-        # ── GET EXISTING ZONE SIGNATURES BEFORE DELETING ──────────
         existing_signatures = get_existing_zone_signatures()
 
-        # ── FETCH APPROVED INCIDENTS ──────────────────────────────
         reports_ref = db.collection('reports').where('status', '==', 'approved')
         docs = list(reports_ref.stream())
 
@@ -213,7 +253,10 @@ def analyze():
 
                 max_dist = 0
                 for i in cluster_incidents:
-                    dist = np.sqrt((i['lat'] - center_lat)**2 + (i['lng'] - center_lng)**2) * 111
+                    dist = np.sqrt(
+                        (i['lat'] - center_lat)**2 +
+                        (i['lng'] - center_lng)**2
+                    ) * 111
                     if dist > max_dist:
                         max_dist = dist
                 radius_km = max(max_dist * 1.3, 0.5)
@@ -291,7 +334,7 @@ def analyze():
                     'createdAt': now_iso,
                 })
 
-        # ── CLEAR OLD ZONES AND SAVE NEW ONES ────────────────────
+        # ── Clear old zones and save new ones ─────────────────────
         old_zones = db.collection('danger_zones').stream()
         for z in old_zones:
             z.reference.delete()
@@ -299,7 +342,7 @@ def analyze():
         for zone in zones:
             db.collection('danger_zones').add(zone)
 
-        # ── FIND GENUINELY NEW ZONES ──────────────────────────────
+        # ── Find genuinely new zones ──────────────────────────────
         new_zones = []
         for zone in zones:
             sig = f"{round(zone['centerLat'], 4)},{round(zone['centerLng'], 4)}"
@@ -308,7 +351,7 @@ def analyze():
 
         print(f'Total zones: {len(zones)}, Genuinely new: {len(new_zones)}')
 
-        # ── ONLY NOTIFY FOR GENUINELY NEW HIGH/MEDIUM ZONES ──────
+        # ── Notify and save for genuinely new HIGH/MEDIUM zones ───
         new_high_medium = [z for z in new_zones
                            if z['severity'] in ['high', 'medium']]
 
@@ -327,7 +370,12 @@ def analyze():
                 body = (f'{medium_count} MEDIUM severity danger zone(s) detected. '
                         f'Exercise caution and stay informed.')
 
+            # Send push notification to all
             send_notification_to_all(title, body)
+
+            # Save to Firestore for all users
+            save_notification_to_all(title, body, 'danger_zone')
+
         else:
             print('No genuinely new high/medium zones — no notification sent')
 

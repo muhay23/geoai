@@ -40,7 +40,7 @@ def save_notification(user_id, title, body, notif_type):
 
 
 # ── HELPER: SAVE NOTIFICATION TO ALL USERS ───────────────────────────
-def save_notification_to_all(title, body, notif_type):
+def save_notification_to_all(title, body, notif_type, zone_lat='0', zone_lng='0'):
     try:
         users = db.collection('users').stream()
         for user in users:
@@ -49,6 +49,8 @@ def save_notification_to_all(title, body, notif_type):
                 'title': title,
                 'body': body,
                 'type': notif_type,
+                'zoneLat': zone_lat,
+                'zoneLng': zone_lng,
                 'isRead': False,
                 'createdAt': datetime.utcnow().isoformat(),
             })
@@ -72,7 +74,7 @@ def get_all_fcm_tokens():
 
 
 # ── HELPER: SEND NOTIFICATION TO ALL USERS ───────────────────────────
-def send_notification_to_all(title, body):
+def send_notification_to_all(title, body, zone_lat='0', zone_lng='0'):
     try:
         tokens = get_all_fcm_tokens()
         if not tokens:
@@ -94,7 +96,11 @@ def send_notification_to_all(title, body):
                         priority='high',
                     ),
                 ),
-                data={'type': 'danger_zone'},
+                data={
+                    'type': 'danger_zone',
+                    'zone_lat': zone_lat,
+                    'zone_lng': zone_lng,
+                },
                 tokens=batch,
             )
             response = messaging.send_each_for_multicast(message)
@@ -361,6 +367,11 @@ def analyze():
             medium_count = len([z for z in new_high_medium
                                 if z['severity'] == 'medium'])
 
+            # Use the most severe new zone for coordinates
+            target_zone = new_high_medium[0]
+            zone_lat = str(target_zone['centerLat'])
+            zone_lng = str(target_zone['centerLng'])
+
             if high_count > 0:
                 title = '🚨 Danger Zone Alert'
                 body = (f'{high_count} HIGH severity danger zone(s) detected. '
@@ -370,11 +381,11 @@ def analyze():
                 body = (f'{medium_count} MEDIUM severity danger zone(s) detected. '
                         f'Exercise caution and stay informed.')
 
-            # Send push notification to all
-            send_notification_to_all(title, body)
+            # Send push notification to all with zone coordinates
+            send_notification_to_all(title, body, zone_lat, zone_lng)
 
-            # Save to Firestore for all users
-            save_notification_to_all(title, body, 'danger_zone')
+            # Save to Firestore for all users with zone coordinates
+            save_notification_to_all(title, body, 'danger_zone', zone_lat, zone_lng)
 
         else:
             print('No genuinely new high/medium zones — no notification sent')
